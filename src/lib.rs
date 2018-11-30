@@ -38,29 +38,16 @@ pub struct Cache {
 impl Cache {
     pub fn new<P: AsRef<Path>>(root: P, max_size: u64, max_files: u64) -> Result<Self> {
         let root = root.as_ref().into();
-        let cache = match CacheInner::new(root, max_size, max_files) {
-            Err(e) => return Err(e),
-            Ok(cache) => cache,
-        };
-
-        Ok(Cache {
+        CacheInner::new(root, max_size, max_files).map(|cache| Cache {
             inner: Arc::new(RwLock::new(cache)),
         })
     }
 
     pub fn add<S: AsRef<str>>(&self, key: S) -> Result<FileGuard> {
         let key: String = key.as_ref().into();
-        let cache = self.inner.clone();
-        let file = {
-            let mut c = cache.write().expect("Cannot lock cache");
-            match c.add(key.clone()) {
-                Ok(f) => f,
-                Err(e) => return Err(e),
-            }
-        };
-
-        Ok(FileGuard {
-            cache,
+        let mut c = self.inner.write().expect("Cannot lock cache");
+        c.add(key.clone()).map(move |file| FileGuard {
+            cache: self.inner.clone(),
             file: Some(file),
             key,
         })
@@ -211,17 +198,16 @@ impl CacheInner {
         }
     }
 
-    fn remove_last(&mut self) -> Result<()>{ 
-
+    // This works only on *nix, as one can delete safely opened files, Windows might require bit different approach
+    fn remove_last(&mut self) -> Result<()> {
         if let Some((_, file_key)) = self.files.pop_front() {
             let file_path = self.entry_path(file_key);
             let file_size = fs::metadata(&file_path)?.len();
             fs::remove_file(file_path)?;
-            self.num_files-=1;
-            self.size-=file_size;
+            self.num_files -= 1;
+            self.size -= file_size;
         }
         Ok(())
-
     }
 
     fn finish(&mut self, key: String, mut file: fs::File) -> Result<()> {
@@ -232,7 +218,7 @@ impl CacheInner {
         file.flush()?;
         let old_path = self.partial_path(file_key.clone());
         let new_file_size = file.metadata()?.len();
-        while self.size + new_file_size > self.max_size || self.num_files+1 > self.max_files {
+        while self.size + new_file_size > self.max_size || self.num_files + 1 > self.max_files {
             self.remove_last()?
         }
         let new_path = self.entry_path(&file_key);
@@ -301,8 +287,8 @@ impl CacheInner {
                 let file_path = self.entry_path(&value);
                 if file_path.exists() {
                     index.insert(key, value);
-                    self.num_files+=1;
-                    self.size+= fs::metadata(file_path)?.len();
+                    self.num_files += 1;
+                    self.size += fs::metadata(file_path)?.len();
                 }
             }
 
@@ -325,7 +311,7 @@ mod tests {
         env_logger::init();
         const MY_KEY: &str = "muj_test_1";
         let temp_dir = tempdir().unwrap();
-        
+
         let msg = "Hello there";
         {
             let c = Cache::new(temp_dir.path(), 10000, 10).unwrap();
@@ -354,7 +340,6 @@ mod tests {
             assert_eq!(msg, msg2);
             let num_files = c.inner.read().unwrap().num_files;
             assert_eq!(1, num_files)
-
         }
     }
 }
