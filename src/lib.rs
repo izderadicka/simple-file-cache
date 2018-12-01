@@ -12,7 +12,7 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use data_encoding::BASE64URL_NOPAD;
 use linked_hash_map::LinkedHashMap;
 use rand::RngCore;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -31,6 +31,7 @@ const FILE_KEY_LEN: usize = 32;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Clone)]
 pub struct Cache {
     inner: Arc<RwLock<CacheInner>>,
 }
@@ -59,8 +60,19 @@ impl Cache {
     }
 
     pub fn save_index(&self) -> Result<()> {
-        let cache = self.inner.read().expect("Cannot lock cache");
+        let cache = self.inner.write().expect("Cannot lock cache");
         cache.save_index()
+    }
+}
+
+impl Drop for Cache {
+    fn drop(&mut self) {
+        // if dropping last reference to cache save index
+        if Arc::strong_count(&self.inner) == 1 {
+            if let Err(e) = self.save_index() {
+                error!("Error saving cache index: {}", e)
+            }
+        }
     }
 }
 
@@ -141,9 +153,11 @@ impl CacheInner {
             fs::create_dir(entries_path)?
         }
         let partial_path = root.join(PARTIAL);
-        if !partial_path.exists() {
-            fs::create_dir(partial_path)?
+        //cleanup previous partial caches
+        if partial_path.exists() {
+            fs::remove_dir_all(&partial_path)?;
         }
+        fs::create_dir(partial_path)?;
 
         let mut cache = CacheInner {
             files: LinkedHashMap::new(),
@@ -286,9 +300,37 @@ impl CacheInner {
                     .map_err(|_| Error::InvalidIndex)?;
                 let file_path = self.entry_path(&value);
                 if file_path.exists() {
-                    index.insert(key, value);
-                    self.num_files += 1;
-                    self.size += fs::metadata(file_path)?.len();
+                    let file_size = fs::metadata(&file_path)?.len();
+                    // cleanup files over limit
+                    if self.num_files + 1 > self.max_files || self.size + file_size > self.max_size
+                    {
+                        fs::remove_file(&file_path)?;
+                        warn!("Removing file above limit {:?}", file_path);
+                    } else {
+                        index.insert(key, value);
+                        self.num_files += 1;
+                        self.size += file_size;
+                    }
+                }
+            }
+
+            //cleanup files not in index
+            {
+                let file_keys_set = index.values().collect::<HashSet<&String>>();
+                let base_dir = self.root.join(ENTRIES);
+                if let Ok(dir_list) = fs::read_dir(&base_dir) {
+                    for f in dir_list {
+                        if let Ok(dir_entry) = f {
+                            if dir_entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                                if let Ok(file_name) = dir_entry.file_name().into_string() {
+                                    if !file_keys_set.contains(&file_name) {
+                                        fs::remove_file(dir_entry.path()).ok();
+                                        warn!("Removing file not in index {:?}", dir_entry.path());
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -308,7 +350,7 @@ mod tests {
     use tempfile::tempdir;
     #[test]
     fn basic_test() {
-        env_logger::init();
+        env_logger::try_init().ok();
         const MY_KEY: &str = "muj_test_1";
         let temp_dir = tempdir().unwrap();
 
@@ -328,7 +370,7 @@ mod tests {
             assert_eq!(msg, msg2);
             let num_files = c.inner.read().unwrap().num_files;
             assert_eq!(1, num_files);
-            c.save_index().unwrap();
+            //c.save_index().unwrap();
         }
 
         {
@@ -340,6 +382,60 @@ mod tests {
             assert_eq!(msg, msg2);
             let num_files = c.inner.read().unwrap().num_files;
             assert_eq!(1, num_files)
+        }
+    }
+
+    #[test]
+    fn test_many_concurrently() {
+        use std::thread;
+        env_logger::try_init().ok();
+        let tmp_folder = tempdir().unwrap();
+
+        fn test_cache(c: &Cache) {
+            {
+                let cache = c.inner.read().unwrap();
+                assert_eq!(5, cache.files.len());
+            }
+            let mut count = 0;
+            for i in 0..10 {
+                match c.get(&format!("Key {}", i)) {
+                    None => (),
+                    Some(res) => {
+                        let mut f = res.unwrap();
+                        let mut s = String::new();
+                        f.read_to_string(&mut s).unwrap();
+                        assert_eq!(format!("Cached content {}", i), s);
+                        count += 1;
+                    }
+                }
+            }
+
+            assert_eq!(5, count);
+        }
+
+        {
+            let mut threads = Vec::new();
+            let c = Cache::new(tmp_folder.path(), 10_000, 5).unwrap();
+            for i in 0..10 {
+                let c = c.clone();
+                threads.push(thread::spawn(move || {
+                    let mut f = c.add(format!("Key {}", i)).unwrap();
+                    let msg = format!("Cached content {}", i);
+                    f.write_all(msg.as_bytes()).unwrap();
+                    f.finish();
+                }));
+            }
+
+            for t in threads {
+                t.join().unwrap();
+            }
+
+            test_cache(&c);
+        }
+
+        {
+            let c = Cache::new(tmp_folder.path(), 10_000, 5).unwrap();
+            test_cache(&c);
         }
     }
 }
