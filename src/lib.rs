@@ -114,14 +114,14 @@ impl FileGuard {
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "already closed"))
     }
-    pub fn finish(&mut self) {
+    pub fn finish(&mut self) -> Result<()> {
         let mut cache = self.cache.write().expect("Cannot lock cache");
         cache
             .finish(
                 self.key.clone(),
                 self.file.take().expect("Invalid cache state"),
             )
-            .expect("Invalid cache state");
+            
     }
 }
 
@@ -230,8 +230,11 @@ impl CacheInner {
             None => return Err(Error::InvalidCacheState("Missing opened key".into())),
         };
         file.flush()?;
-        let old_path = self.partial_path(file_key.clone());
         let new_file_size = file.metadata()?.len();
+        if new_file_size > self.max_size {
+            return Err(Error::FileTooBig)
+        }
+        let old_path = self.partial_path(file_key.clone());
         while self.size + new_file_size > self.max_size || self.num_files + 1 > self.max_files {
             self.remove_last()?
         }
@@ -361,7 +364,7 @@ mod tests {
                 let mut f = c.add(MY_KEY).unwrap();
 
                 f.write(msg.as_bytes()).unwrap();
-                f.finish()
+                f.finish().unwrap();
             }
             let mut f = c.get(MY_KEY).unwrap().unwrap();
 
@@ -422,7 +425,7 @@ mod tests {
                     let mut f = c.add(format!("Key {}", i)).unwrap();
                     let msg = format!("Cached content {}", i);
                     f.write_all(msg.as_bytes()).unwrap();
-                    f.finish();
+                    f.finish().unwrap();
                 }));
             }
 
@@ -436,6 +439,64 @@ mod tests {
         {
             let c = Cache::new(tmp_folder.path(), 10_000, 5).unwrap();
             test_cache(&c);
+        }
+    }
+
+    #[test]
+    fn test_size() {
+        use std::thread;
+        use rand::Rng;
+
+        env_logger::try_init().ok();
+        let tmp_folder = tempdir().unwrap();
+
+        let mut data = [0_u8;1024];
+        let mut rng = rand::thread_rng();
+        rng.fill_bytes(&mut data);
+
+        fn test_cache(c: &Cache, data: &[u8]) {
+            {
+                let cache = c.inner.read().unwrap();
+                assert_eq!(5, cache.files.len());
+            }
+            let mut count = 0;
+            for i in 0..10 {
+                match c.get(&format!("Key {}", i)) {
+                    None => (),
+                    Some(res) => {
+                        let mut f = res.unwrap();
+                        let mut s = Vec::new();
+                        f.read_to_end(&mut s).unwrap();
+                        assert_eq!(data, &s[..]);
+                        count += 1;
+                    }
+                }
+            }
+
+            assert_eq!(5, count);
+        }
+
+        {
+            let mut threads = Vec::new();
+            let c = Cache::new(tmp_folder.path(), 6_000, 1000).unwrap();
+            for i in 0..10 {
+                let c = c.clone();
+                threads.push(thread::spawn(move || {
+                    let mut f = c.add(format!("Key {}", i)).unwrap();
+                    let mut rng = rand::thread_rng();
+                    for j in 0..8 {
+                    f.write_all(&data[128*j..128*(j+1)]).unwrap();
+                    thread::sleep(std::time::Duration::from_millis(rng.gen_range(1,100)))
+                    }
+                    f.finish().unwrap();
+                }));
+            }
+
+            for t in threads {
+                t.join().unwrap();
+            }
+
+            test_cache(&c, &data);
         }
     }
 }

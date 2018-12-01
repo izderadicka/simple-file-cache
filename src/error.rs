@@ -21,6 +21,10 @@ quick_error! {
             display("index file is invalid")
         }
 
+        FileTooBig {
+            display("file bigger then max cache size")
+        }
+
         KeyOpened(key: String) {
             display("key {} is being added", key)
         }
