@@ -6,8 +6,8 @@ extern crate quick_error;
 #[macro_use]
 extern crate log;
 extern crate byteorder;
-extern crate filetime;
-
+#[cfg(feature = "asynch")]
+use self::asynch::{CacheFileRead, CacheFileWrite};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use data_encoding::BASE64URL_NOPAD;
 use linked_hash_map::LinkedHashMap;
@@ -21,6 +21,8 @@ use std::sync::{Arc, RwLock};
 
 pub use self::error::Error;
 
+#[cfg(feature = "asynch")]
+mod asynch;
 mod error;
 
 const PARTIAL: &str = "partial";
@@ -54,6 +56,20 @@ impl Cache {
         })
     }
 
+    #[cfg(feature = "asynch")]
+    pub fn add_async<S: AsRef<str>>(&self, key: S) -> CacheFileWrite {
+        let key: String = key.as_ref().into();
+        CacheFileWrite::new(self.inner.clone(), key)
+    }
+
+    #[cfg(feature = "asynch")]
+    pub fn get_async<S>(&self, key: S) -> CacheFileRead<S>
+    where
+        S: AsRef<str>
+    {
+        CacheFileRead::new(self.inner.clone(), key)
+    }
+
     pub fn get<S: AsRef<str>>(&self, key: S) -> Option<Result<fs::File>> {
         let mut cache = self.inner.write().expect("Cannot lock cache");
         cache.get(key)
@@ -68,6 +84,7 @@ impl Cache {
 impl Drop for Cache {
     fn drop(&mut self) {
         // if dropping last reference to cache save index
+        // TODO: reconsider - also FileGuards can hold refeence
         if Arc::strong_count(&self.inner) == 1 {
             if let Err(e) = self.save_index() {
                 error!("Error saving cache index: {}", e)
@@ -115,13 +132,13 @@ impl FileGuard {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "already closed"))
     }
     pub fn finish(&mut self) -> Result<()> {
-        let mut cache = self.cache.write().expect("Cannot lock cache");
-        cache
-            .finish(
-                self.key.clone(),
-                self.file.take().expect("Invalid cache state"),
-            )
-            
+        match self.file {
+            None => panic!("Invalid cache state"),
+            Some(ref mut file) => {
+                let mut cache = self.cache.write().expect("Cannot lock cache");
+                cache.finish(self.key.clone(), file)
+            }
+        }
     }
 }
 
@@ -197,19 +214,22 @@ impl CacheInner {
         }
     }
 
+    fn get_entry_path<S: AsRef<str>>(&mut self, key: S) -> Option<PathBuf> {
+        let root = &self.root;
+        self.files
+            .get_refresh(key.as_ref())
+            .map(|file_key| entry_path_helper(root, file_key))
+    }
+
     fn get<S: AsRef<str>>(&mut self, key: S) -> Option<Result<fs::File>> {
-        let k: &str = key.as_ref();
-        match self.files.get_refresh(k) {
-            None => return None,
-            Some(file_key) => {
-                let file_name = entry_path_helper(&self.root, &file_key);
-                // let now = filetime::FileTime::from_system_time(SystemTime::now());
-                // if let Err(e) = filetime::set_file_times(&file_name, now, now) {
-                //     error!("Cannot set mtime for file {:?} error {}", file_name, e)
-                // }
-                Some(fs::File::open(file_name).map_err(|e| e.into()))
-            }
-        }
+        self.get_entry_path(key)
+            .map(|file_name| fs::File::open(file_name).map_err(|e| e.into()))
+
+        // Code to use if we wanted to update timestamp of file too, but generally should not be necessary
+        // let now = filetime::FileTime::from_system_time(SystemTime::now());
+        // if let Err(e) = filetime::set_file_times(&file_name, now, now) {
+        //     error!("Cannot set mtime for file {:?} error {}", file_name, e)
+        // }
     }
 
     // This works only on *nix, as one can delete safely opened files, Windows might require bit different approach
@@ -224,7 +244,7 @@ impl CacheInner {
         Ok(())
     }
 
-    fn finish(&mut self, key: String, mut file: fs::File) -> Result<()> {
+    fn finish(&mut self, key: String, file: &mut fs::File) -> Result<()> {
         let file_key = match self.opened.remove(&key) {
             Some(key) => key,
             None => return Err(Error::InvalidCacheState("Missing opened key".into())),
@@ -232,7 +252,7 @@ impl CacheInner {
         file.flush()?;
         let new_file_size = file.metadata()?.len();
         if new_file_size > self.max_size {
-            return Err(Error::FileTooBig)
+            return Err(Error::FileTooBig);
         }
         let old_path = self.partial_path(file_key.clone());
         while self.size + new_file_size > self.max_size || self.num_files + 1 > self.max_files {
@@ -444,13 +464,13 @@ mod tests {
 
     #[test]
     fn test_size() {
-        use std::thread;
         use rand::Rng;
+        use std::thread;
 
         env_logger::try_init().ok();
         let tmp_folder = tempdir().unwrap();
 
-        let mut data = [0_u8;1024];
+        let mut data = [0_u8; 1024];
         let mut rng = rand::thread_rng();
         rng.fill_bytes(&mut data);
 
@@ -485,8 +505,8 @@ mod tests {
                     let mut f = c.add(format!("Key {}", i)).unwrap();
                     let mut rng = rand::thread_rng();
                     for j in 0..8 {
-                    f.write_all(&data[128*j..128*(j+1)]).unwrap();
-                    thread::sleep(std::time::Duration::from_millis(rng.gen_range(1,100)))
+                        f.write_all(&data[128 * j..128 * (j + 1)]).unwrap();
+                        thread::sleep(std::time::Duration::from_millis(rng.gen_range(1, 100)))
                     }
                     f.finish().unwrap();
                 }));
@@ -499,4 +519,5 @@ mod tests {
             test_cache(&c, &data);
         }
     }
+
 }
