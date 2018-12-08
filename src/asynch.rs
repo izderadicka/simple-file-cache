@@ -50,7 +50,7 @@ impl <S: AsRef<str>+Clone> Future for CacheFileRead<S> {
 }
 
 impl Future for CacheFileWrite {
-    type Item = (tokio_fs::File, Finish);
+    type Item = (tokio_fs::File, Finisher);
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
@@ -63,7 +63,7 @@ impl Future for CacheFileWrite {
                     .map(|(f, f2)| {
                         (
                             tokio_fs::File::from_std(f),
-                            Finish {
+                            Finisher {
                                 cache: self.cache.clone(),
                                 key: Some(key.clone()),
                                 file: f2,
@@ -92,6 +92,56 @@ impl CacheFileWrite {
             }
         } 
 }
+
+pub struct Finisher{
+    pub(crate) cache: Arc<RwLock<CacheInner>>,
+    pub(crate) key: Option<String>,
+    pub(crate) file: fs::File,
+}
+
+impl Finisher {
+    pub fn commit(self) -> Finish {
+        Finish{
+            cache:self.cache,
+            key: self.key,
+            file: self.file
+        }
+    }
+
+    pub fn roll_back(self) -> CleanUp {
+        CleanUp{
+            cache:self.cache,
+            key: self.key,
+        }
+    }
+}
+
+pub struct CleanUp {
+    pub(crate) cache: Arc<RwLock<CacheInner>>,
+    pub(crate) key: Option<String>,
+}
+
+impl Future for CleanUp {
+    type Item = ();
+    type Error = Error;
+
+    fn poll (&mut self) -> Poll<Self::Item, Self::Error> {
+        match self.key.take() {
+            None => panic!("Calling resolved future"),
+            Some(key) => match blocking(|| {
+                super::cleanup(&self.cache, &key)       
+            }) {
+                Err(e) => Err(e.into()),
+                Ok(Async::Ready(())) => Ok(Async::Ready(())),
+                Ok(Async::NotReady) => {
+                    self.key = Some(key);
+                    Ok(Async::NotReady)
+                    },
+            },
+        }
+    }
+}
+
 
 
 
@@ -147,7 +197,7 @@ use super::*;
             .and_then(move |(w,fin)| { 
                 tokio::io::write_all(w,msg.clone())
                 .map_err(|e| e.into())
-                .and_then(|_| fin)
+                .and_then(|_| fin.commit())
             })
             .and_then(move |_| {
                 c.get_async(MY_KEY)

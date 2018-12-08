@@ -51,7 +51,7 @@ impl Cache {
         let mut c = self.inner.write().expect("Cannot lock cache");
         c.add(key.clone()).map(move |file| FileGuard {
             cache: self.inner.clone(),
-            file: Some(file),
+            file: file,
             key,
         })
     }
@@ -65,7 +65,7 @@ impl Cache {
     #[cfg(feature = "asynch")]
     pub fn get_async<S>(&self, key: S) -> CacheFileRead<S>
     where
-        S: AsRef<str>
+        S: AsRef<str>,
     {
         CacheFileRead::new(self.inner.clone(), key)
     }
@@ -95,50 +95,49 @@ impl Drop for Cache {
 
 pub struct FileGuard {
     cache: Arc<RwLock<CacheInner>>,
-    file: Option<fs::File>,
+    file: fs::File,
     key: String,
 }
 
 impl io::Write for FileGuard {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.get_file().and_then(|mut f| f.write(buf))
+       self.file.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.get_file().and_then(|mut f| f.flush())
+        self.file.flush()
     }
+}
+
+fn cleanup<S:AsRef<str>>(cache: &Arc<RwLock<CacheInner>>, key:S) {
+    let file_name = {
+            let mut cache = cache.write().expect("Cannot lock cache");
+            let file_key = cache.opened.remove(key.as_ref());
+            file_key.map(|k| cache.partial_path(&k))
+        };
+
+        debug!("Cleanup for file {:?}", file_name);
+
+        if let Some(file_name) = file_name {
+            if file_name.exists() {
+                if let Err(e) = fs::remove_file(&file_name) {
+                    error!("Cannot delete file {:?}, error {}", file_name, e)
+                }
+            }
+        }
 }
 
 impl Drop for FileGuard {
     fn drop(&mut self) {
         // need to clean up if opened item was not properly finished
-        let file_name = {
-            let cache = self.cache.read().expect("Cannot lock cache");
-            cache.partial_path(&self.key)
-        };
-
-        if file_name.exists() {
-            if let Err(e) = fs::remove_file(&file_name) {
-                error!("Cannot delete file {:?}, error {}", file_name, e)
-            }
-        }
+        cleanup(&self.cache, &self.key)
     }
 }
 
 impl FileGuard {
-    fn get_file(&self) -> io::Result<&fs::File> {
-        self.file
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "already closed"))
-    }
     pub fn finish(&mut self) -> Result<()> {
-        match self.file {
-            None => panic!("Invalid cache state"),
-            Some(ref mut file) => {
-                let mut cache = self.cache.write().expect("Cannot lock cache");
-                cache.finish(self.key.clone(), file)
-            }
-        }
+        let mut cache = self.cache.write().expect("Cannot lock cache");
+        cache.finish(self.key.clone(), &mut self.file)
     }
 }
 
@@ -518,6 +517,26 @@ mod tests {
 
             test_cache(&c, &data);
         }
+    }
+
+    #[test]
+    fn test_cleanup() {
+        env_logger::try_init().ok();
+        let tmp_folder = tempdir().unwrap();
+        let c = Cache::new(tmp_folder.path(), 10_000, 50).unwrap();
+        let p = c.inner.read().unwrap().partial_path("test");
+        let p = p.parent().unwrap();
+        let list_path = || {
+            use std::fs;
+            fs::read_dir(p).unwrap().count()
+        };
+
+        {
+            let _f = c.add("usak");
+            assert_eq!(1, list_path());
+        }
+
+        assert_eq!(0, list_path())
     }
 
 }
