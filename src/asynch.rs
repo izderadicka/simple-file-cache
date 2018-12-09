@@ -49,6 +49,44 @@ impl <S: AsRef<str>+Clone> Future for CacheFileRead<S> {
     }
 }
 
+pub struct CacheFileRead2<S> {
+    cache: Arc<RwLock<CacheInner>>,
+    key: Option<S>
+}
+
+impl <S: AsRef<str>> CacheFileRead2<S> {
+    pub(crate) fn new(cache: Arc<RwLock<CacheInner>>, key:S) -> Self {
+        CacheFileRead2 {
+            cache,
+            key: Some(key)
+        }
+    }
+}
+
+impl <S: AsRef<str>+Clone> Future for CacheFileRead2<S> {
+    type Error = Error;
+    type Item = Option<(tokio_fs::File, std::path::PathBuf)>;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        match self.key.take() {
+            None => panic!("Calling resolved future"),
+            Some(key) => match blocking(|| {
+                let mut c = self.cache.write().expect("Cannot lock cache");
+                c.get2(key.clone()).map(|f| f.map(|(f,path)| (tokio_fs::File::from_std(f),path)))
+                }) {
+                Err(e) => Err(e.into()),
+                Ok(Async::Ready(None)) => Ok(Async::Ready(None)),
+                Ok(Async::Ready(Some(Err(e)))) => Err(e.into()),
+                Ok(Async::Ready(Some(Ok(r)))) => Ok(Async::Ready(Some(r))),
+                Ok(Async::NotReady) => {
+                    self.key = Some(key);
+                    Ok(Async::NotReady)
+                    },
+            },
+        }
+    }
+}
+
 impl Future for CacheFileWrite {
     type Item = (tokio_fs::File, Finisher);
     type Error = Error;
@@ -139,6 +177,29 @@ impl Future for CleanUp {
                     },
             },
         }
+    }
+}
+
+pub struct SaveIndex {
+    pub(crate) cache: Arc<RwLock<CacheInner>>,
+}
+
+impl Future for SaveIndex {
+    type Item = ();
+    type Error = Error;
+
+    fn poll (&mut self) -> Poll<Self::Item, Self::Error> {
+            match blocking(|| {
+                let cache = self.cache.write().unwrap();
+                cache.save_index()
+
+            }) {
+                Err(e) => Err(e.into()),
+                Ok(Async::Ready(Err(e))) => Err(e),
+                Ok(Async::Ready(Ok(()))) => Ok(Async::Ready(())),
+                Ok(Async::NotReady) => Ok(Async::NotReady)
+                    
+            }
     }
 }
 

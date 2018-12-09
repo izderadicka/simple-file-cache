@@ -7,7 +7,7 @@ extern crate quick_error;
 extern crate log;
 extern crate byteorder;
 #[cfg(feature = "asynch")]
-use self::asynch::{CacheFileRead, CacheFileWrite};
+use self::asynch::{CacheFileRead, CacheFileRead2, CacheFileWrite, SaveIndex};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use data_encoding::BASE64URL_NOPAD;
 use linked_hash_map::LinkedHashMap;
@@ -70,6 +70,14 @@ impl Cache {
         CacheFileRead::new(self.inner.clone(), key)
     }
 
+    #[cfg(feature = "asynch")]
+    pub fn get_async2<S>(&self, key: S) -> CacheFileRead2<S>
+    where
+        S: AsRef<str>,
+    {
+        CacheFileRead2::new(self.inner.clone(), key)
+    }
+
     pub fn get<S: AsRef<str>>(&self, key: S) -> Option<Result<fs::File>> {
         let mut cache = self.inner.write().expect("Cannot lock cache");
         cache.get(key)
@@ -78,6 +86,32 @@ impl Cache {
     pub fn save_index(&self) -> Result<()> {
         let cache = self.inner.write().expect("Cannot lock cache");
         cache.save_index()
+    }
+
+    #[cfg(feature = "asynch")]
+    pub fn save_index_async(&self) -> SaveIndex {
+        SaveIndex {
+            cache: self.inner.clone()
+        }
+    }
+
+
+    pub fn len(&self) -> u64 {
+        self.inner.read().unwrap().num_files
+    }
+
+    pub fn max_size(&self) -> u64 {
+        self.inner.read().unwrap().max_size
+    }
+
+    pub fn max_files(&self) -> u64 {
+        self.inner.read().unwrap().max_files
+    }
+
+    /// return tuple (free_files, free_size)
+    pub fn free_capacity(&self) -> (u64, u64) {
+        let c = self.inner.read().unwrap();
+        (c.max_files - c.num_files, c.max_size - c.size)
     }
 }
 
@@ -101,7 +135,7 @@ pub struct FileGuard {
 
 impl io::Write for FileGuard {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-       self.file.write(buf)
+        self.file.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -109,22 +143,22 @@ impl io::Write for FileGuard {
     }
 }
 
-fn cleanup<S:AsRef<str>>(cache: &Arc<RwLock<CacheInner>>, key:S) {
+fn cleanup<S: AsRef<str>>(cache: &Arc<RwLock<CacheInner>>, key: S) {
     let file_name = {
-            let mut cache = cache.write().expect("Cannot lock cache");
-            let file_key = cache.opened.remove(key.as_ref());
-            file_key.map(|k| cache.partial_path(&k))
-        };
+        let mut cache = cache.write().expect("Cannot lock cache");
+        let file_key = cache.opened.remove(key.as_ref());
+        file_key.map(|k| cache.partial_path(&k))
+    };
 
-        debug!("Cleanup for file {:?}", file_name);
+    debug!("Cleanup for file {:?}", file_name);
 
-        if let Some(file_name) = file_name {
-            if file_name.exists() {
-                if let Err(e) = fs::remove_file(&file_name) {
-                    error!("Cannot delete file {:?}, error {}", file_name, e)
-                }
+    if let Some(file_name) = file_name {
+        if file_name.exists() {
+            if let Err(e) = fs::remove_file(&file_name) {
+                error!("Cannot delete file {:?}, error {}", file_name, e)
             }
         }
+    }
 }
 
 impl Drop for FileGuard {
@@ -162,19 +196,36 @@ struct CacheInner {
     num_files: u64,
 }
 
+fn recreate_dir<P: AsRef<Path>>(dir: P) -> io::Result<bool> {
+    let dir = dir.as_ref();
+    if dir.exists() {
+        debug!("Recreating {:?}", dir);
+        fs::remove_dir_all(&dir)?;
+        fs::create_dir(&dir)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 impl CacheInner {
     fn new(root: PathBuf, max_size: u64, max_files: u64) -> Result<Self> {
+        let created_root = if !root.exists() {
+            fs::create_dir(&root)?;
+            true
+        } else {
+            false
+        };
         let entries_path = root.join(ENTRIES);
         if !entries_path.exists() {
-            fs::create_dir(entries_path)?
+            fs::create_dir(&entries_path)?
         }
         let partial_path = root.join(PARTIAL);
         //cleanup previous partial caches
-        if partial_path.exists() {
-            fs::remove_dir_all(&partial_path)?;
+        if !recreate_dir(&partial_path)? {
+            fs::create_dir(partial_path)?;
         }
-        fs::create_dir(partial_path)?;
-
+        
         let mut cache = CacheInner {
             files: LinkedHashMap::new(),
             opened: HashMap::new(),
@@ -184,9 +235,16 @@ impl CacheInner {
             size: 0,
             num_files: 0,
         };
-        if let Err(e) = cache.load_index() {
-            error!("Error loading cache index {}", e);
-            //TODO - clean entries if cannot load index
+        match cache.load_index() {
+            Err(e) => {
+                error!("Error loading cache index {}", e);
+                recreate_dir(&entries_path)?;
+            }
+            Ok(false) if !created_root => {
+                warn!("No cache index found,");
+                recreate_dir(&entries_path)?;
+            }
+            _ => (),
         }
         Ok(cache)
     }
@@ -223,6 +281,20 @@ impl CacheInner {
     fn get<S: AsRef<str>>(&mut self, key: S) -> Option<Result<fs::File>> {
         self.get_entry_path(key)
             .map(|file_name| fs::File::open(file_name).map_err(|e| e.into()))
+
+        // Code to use if we wanted to update timestamp of file too, but generally should not be necessary
+        // let now = filetime::FileTime::from_system_time(SystemTime::now());
+        // if let Err(e) = filetime::set_file_times(&file_name, now, now) {
+        //     error!("Cannot set mtime for file {:?} error {}", file_name, e)
+        // }
+    }
+
+    fn get2<S: AsRef<str>>(&mut self, key: S) -> Option<Result<(fs::File, PathBuf)>> {
+        self.get_entry_path(key)
+            .map(|file_name| fs::File::open(&file_name)
+            .map_err(|e| e.into())
+            .map(|f| (f, file_name))
+            )
 
         // Code to use if we wanted to update timestamp of file too, but generally should not be necessary
         // let now = filetime::FileTime::from_system_time(SystemTime::now());
@@ -289,7 +361,7 @@ impl CacheInner {
         Ok(())
     }
 
-    fn load_index(&mut self) -> Result<()> {
+    fn load_index(&mut self) -> Result<bool> {
         let index_path = self.root.join(INDEX);
 
         if index_path.exists() {
@@ -357,8 +429,11 @@ impl CacheInner {
             }
 
             self.files = index;
+            Ok(true)
+        } else {
+            debug!("No index file");
+            Ok(false)
         }
-        Ok(())
     }
 }
 
