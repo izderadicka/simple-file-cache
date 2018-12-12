@@ -208,6 +208,36 @@ fn recreate_dir<P: AsRef<Path>>(dir: P) -> io::Result<bool> {
     }
 }
 
+macro_rules! get_cleanup {
+    ($self:ident, $res:ident, $path:ident, $key:ident) => {
+
+        {
+            
+        // Code to use if we wanted to update timestamp of file too, but generally should not be necessary
+        // let now = filetime::FileTime::from_system_time(SystemTime::now());
+        // if let Err(e) = filetime::set_file_times(&file_name, now, now) {
+        //     error!("Cannot set mtime for file {:?} error {}", file_name, e)
+        // }
+        
+        // cleanup if file was deleted
+        if let Some(Err(_)) = $res {
+            if let Some(file_name) = $path {
+            if ! file_name.exists() {
+                error!("File was deleted for key {} ",$key.as_ref());
+                $self.remove($key.as_ref()).ok();
+               
+            }
+            }
+        }
+
+        $res
+
+    }
+        
+        
+    };
+}
+
 impl CacheInner {
     fn new(root: PathBuf, max_size: u64, max_files: u64) -> Result<Self> {
         let created_root = if !root.exists() {
@@ -278,29 +308,25 @@ impl CacheInner {
             .map(|file_key| entry_path_helper(root, file_key))
     }
 
-    fn get<S: AsRef<str>>(&mut self, key: S) -> Option<Result<fs::File>> {
-        self.get_entry_path(key)
-            .map(|file_name| fs::File::open(file_name).map_err(|e| e.into()))
 
-        // Code to use if we wanted to update timestamp of file too, but generally should not be necessary
-        // let now = filetime::FileTime::from_system_time(SystemTime::now());
-        // if let Err(e) = filetime::set_file_times(&file_name, now, now) {
-        //     error!("Cannot set mtime for file {:?} error {}", file_name, e)
-        // }
+    fn get<S: AsRef<str>>(&mut self, key: S) -> Option<Result<fs::File>> {
+        let file_name = self.get_entry_path(&key);
+        let res = file_name.as_ref()
+            .map(|file_name| fs::File::open(file_name).map_err(|e| e.into()));
+        
+        get_cleanup!(self, res, file_name, key)
+        
     }
 
     fn get2<S: AsRef<str>>(&mut self, key: S) -> Option<Result<(fs::File, PathBuf)>> {
-        self.get_entry_path(key)
+        let file_name = self.get_entry_path(&key);
+        let res = file_name.as_ref()
             .map(|file_name| fs::File::open(&file_name)
             .map_err(|e| e.into())
-            .map(|f| (f, file_name))
-            )
+            .map(|f| (f, file_name.clone()))
+            );
 
-        // Code to use if we wanted to update timestamp of file too, but generally should not be necessary
-        // let now = filetime::FileTime::from_system_time(SystemTime::now());
-        // if let Err(e) = filetime::set_file_times(&file_name, now, now) {
-        //     error!("Cannot set mtime for file {:?} error {}", file_name, e)
-        // }
+        get_cleanup!(self, res, file_name, key)
     }
 
     // This works only on *nix, as one can delete safely opened files, Windows might require bit different approach
@@ -314,6 +340,39 @@ impl CacheInner {
         }
         Ok(())
     }
+
+    fn remove<S:AsRef<str>>(&mut self, key:S) -> Result<()> {
+        if let Some(file_key) = self.files.remove(key.as_ref()) {
+            let file_path = self.entry_path(file_key);
+            self.num_files -= 1;
+            match fs::metadata(&file_path) {
+                Ok(meta) => {
+                    let file_size = meta.len();
+                    self.size -= file_size;
+                }
+                Err(e) => {
+                    error!("Cannot get meta for file {:?} due to error {}", file_path,e);
+                    // this means that index is out of sync with fs - recalculate cache size
+                    let mut new_size = 0;
+                    for (_,file_key) in &self.files {
+                        let fname = entry_path_helper(&self.root, file_key);
+                        if let Ok(meta) = fs::metadata(fname) {
+                            new_size += meta.len()
+                        }
+
+                    }
+                    self.size = new_size;
+                }
+            }
+            
+            fs::remove_file(file_path)?;
+           
+            
+        }
+        Ok(())
+    }
+
+
 
     fn finish(&mut self, key: String, file: &mut fs::File) -> Result<()> {
         let file_key = match self.opened.remove(&key) {
@@ -467,7 +526,6 @@ mod tests {
             assert_eq!(msg, msg2);
             let num_files = c.inner.read().unwrap().num_files;
             assert_eq!(1, num_files);
-            //c.save_index().unwrap();
         }
 
         {
@@ -479,6 +537,45 @@ mod tests {
             assert_eq!(msg, msg2);
             let num_files = c.inner.read().unwrap().num_files;
             assert_eq!(1, num_files)
+        }
+    }
+
+    #[test]
+    fn test_cleanup_if_deleted() {
+        env_logger::try_init().ok();
+        const MY_KEY: &str = "muj_test_1";
+        let temp_dir = tempdir().unwrap();
+
+        let msg = "Hello there";
+        {
+            let c = Cache::new(temp_dir.path(), 10000, 10).unwrap();
+            {
+                let mut f = c.add(MY_KEY).unwrap();
+                f.write(msg.as_bytes()).unwrap();
+                f.finish().unwrap();
+                let mut f = c.add("second").unwrap();
+                f.write("0123456789".as_bytes()).unwrap();
+                f.finish().unwrap();
+            }
+            let (_f,fname) = {
+                let mut cache = c.inner.write().unwrap();
+                cache.get2(MY_KEY).unwrap().unwrap()
+            };
+            fs::remove_file(fname).unwrap();
+
+            
+
+            if let Some(Err(_)) = c.get(MY_KEY) {
+                let num_files = c.inner.read().unwrap().num_files;
+                assert_eq!(1, num_files);
+                let size = c.inner.read().unwrap().size;
+                assert_eq!(10, size);
+            } else {
+                panic!("get should return error, if file was deleted");
+            }
+
+           
+            
         }
     }
 
